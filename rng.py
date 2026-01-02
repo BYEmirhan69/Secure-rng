@@ -1,83 +1,125 @@
 from __future__ import annotations
 
-import hashlib
-import hmac
 import os
+import threading
+import time
 from dataclasses import dataclass
 from secrets import token_bytes
 
 from cryptography.hazmat.backends import default_backend
+from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
 MAX_REQUEST = 10_000_000  
 
 
 def _hkdf_sha256(ikm: bytes, salt: bytes, info: bytes, out_len: int) -> bytes:
-    """Minimal HKDF-SHA256 (extract+expand)."""
-    prk = hmac.new(salt, ikm, hashlib.sha256).digest()
-    okm = b""
-    t = b""
-    c = 1
-    while len(okm) < out_len:
-        t = hmac.new(prk, t + info + bytes([c]), hashlib.sha256).digest()
-        okm += t
-        c += 1
-    return okm[:out_len]
+    hkdf = HKDF(
+        algorithm=hashes.SHA256(),
+        length=out_len,
+        salt=salt,
+        info=info,
+    )
+    return hkdf.derive(ikm)
 
 
-@dataclass
+def _zero_bytes(b: bytearray) -> None:
+    """Best-effort memory zeroing."""
+    for i in range(len(b)):
+        b[i] = 0
+
+
+@dataclass(slots=True)
 class SecureRNG:
-    """
-    SecureRNG: OS CSPRNG entropy + ChaCha20-based DRBG
-
-    API:
-      - next_bytes(n) -> bytes
-      - reseed(extra=b"") -> None
-      - randbelow(k) -> int (opsiyonel)
-    """
-
-    _key: bytes
-    _nonce: bytes
+    _key: bytearray          
+    _nonce_base: bytearray   
     _counter: int
     _generated: int
-    _reseed_interval: int
+
+    _reseed_interval_bytes: int
+    _reseed_interval_seconds: float
+    _last_reseed_time: float
+
+    _pid: int              
+    _lock: threading.Lock
 
     @staticmethod
-    def new(reseed_interval_bytes: int = 1_048_576, extra_seed: bytes = b"") -> "SecureRNG":
-        """Create a new SecureRNG instance."""
-        entropy = token_bytes(32)
+    def new(
+        reseed_interval_bytes: int = 1_048_576,
+        reseed_interval_seconds: float = 60.0,
+        extra_seed: bytes = b"",
+    ) -> "SecureRNG":
 
-        noise = (
-            os.urandom(16)
-            + str(os.getpid()).encode()
-            + str(os.getppid()).encode()
-            + str(id(object())).encode()   
-        )
+        entropy = token_bytes(32)
+        noise = os.urandom(32)
 
         ikm = entropy + extra_seed + noise
         salt = token_bytes(32)
 
-        material = _hkdf_sha256(ikm=ikm, salt=salt, info=b"SecureRNG-v1 init", out_len=48)
-        return SecureRNG(
-            _key=material[:32],
-            _nonce=material[32:48],
-            _counter=0,
-            _generated=0,
-            _reseed_interval=max(64 * 1024, reseed_interval_bytes),
+        material = _hkdf_sha256(
+            ikm=ikm,
+            salt=salt,
+            info=b"SecureRNG-v4 init",
+            out_len=48,
         )
 
-    def reseed(self, extra: bytes = b"") -> None:
-        """Refresh internal state with new entropy."""
+        key = bytearray(material[:32])
+        nonce_base = bytearray(material[32:48])
+
+        _zero_bytes(bytearray(material))
+        _zero_bytes(bytearray(entropy))
+
+        now = time.monotonic()
+
+        return SecureRNG(
+            _key=key,
+            _nonce_base=nonce_base,
+            _counter=0,
+            _generated=0,
+            _reseed_interval_bytes=max(64 * 1024, reseed_interval_bytes),
+            _reseed_interval_seconds=float(reseed_interval_seconds),
+            _last_reseed_time=now,
+            _pid=os.getpid(),
+            _lock=threading.Lock(),
+        )
+
+    def _reseed_locked(self, extra: bytes) -> None:
         entropy = token_bytes(32)
         salt = token_bytes(32)
 
-        ikm = self._key + self._nonce + self._counter.to_bytes(8, "big") + entropy + extra
-        material = _hkdf_sha256(ikm=ikm, salt=salt, info=b"SecureRNG-v1 reseed", out_len=48)
+        ikm = (
+            bytes(self._key)
+            + bytes(self._nonce_base)
+            + self._counter.to_bytes(8, "big")
+            + entropy
+            + extra
+        )
 
-        self._key = material[:32]
-        self._nonce = material[32:48]
+        material = _hkdf_sha256(
+            ikm=ikm,
+            salt=salt,
+            info=b"SecureRNG-v4 reseed",
+            out_len=48,
+        )
+
+        _zero_bytes(self._key)
+        _zero_bytes(self._nonce_base)
+
+        self._key = bytearray(material[:32])
+        self._nonce_base = bytearray(material[32:48])
+
         self._counter = 0
         self._generated = 0
+        self._last_reseed_time = time.monotonic()
+        self._pid = os.getpid()
+
+        _zero_bytes(bytearray(material))
+        _zero_bytes(bytearray(entropy))
+
+    def reseed(self, extra: bytes = b"") -> None:
+        with self._lock:
+            self._reseed_locked(extra)
 
     def next_bytes(self, n: int) -> bytes:
         if not isinstance(n, int) or n < 0:
@@ -87,33 +129,47 @@ class SecureRNG:
         if n > MAX_REQUEST:
             raise ValueError(f"n too large (max {MAX_REQUEST})")
 
-        if self._generated >= self._reseed_interval:
-            self.reseed()
+        with self._lock:
+            if os.getpid() != self._pid:
+                self._reseed_locked(b"")
 
-        out = bytearray()
-        backend = default_backend()
+            now = time.monotonic()
+            if (
+                self._generated >= self._reseed_interval_bytes
+                or (now - self._last_reseed_time) >= self._reseed_interval_seconds
+            ):
+                self._reseed_locked(b"")
 
-        while len(out) < n:
-            cbytes = self._counter.to_bytes(8, "big")
+            out = bytearray()
+            backend = default_backend()
 
-            per_nonce = _hkdf_sha256(
-                ikm=self._nonce + cbytes,
-                salt=b"SecureRNG-nonce-salt",
-                info=b"SecureRNG-v1 per-block nonce",
-                out_len=16,
+            while len(out) < n:
+                per_nonce = self._nonce_base[:8] + self._counter.to_bytes(8, "big")
+
+                cipher = Cipher(
+                    algorithms.ChaCha20(bytes(self._key), per_nonce),
+                    mode=None,
+                    backend=backend,
+                )
+
+                out.extend(cipher.encryptor().update(b"\x00" * 64))
+                self._counter += 1
+
+            new_key = _hkdf_sha256(
+                ikm=bytes(self._key) + self._counter.to_bytes(8, "big"),
+                salt=bytes(self._nonce_base),
+                info=b"SecureRNG-v4 key-evolve",
+                out_len=32,
             )
 
-            cipher = Cipher(algorithms.ChaCha20(self._key, per_nonce), mode=None, backend=backend)
-            block = cipher.encryptor().update(b"\x00" * 64)
+            _zero_bytes(self._key)
+            self._key = bytearray(new_key)
+            _zero_bytes(bytearray(new_key))
 
-            out.extend(block)
-            self._counter += 1
-
-        self._generated += n
-        return bytes(out[:n])
+            self._generated += n
+            return bytes(out[:n])
 
     def randbelow(self, k: int) -> int:
-        """Uniform integer in [0, k)."""
         if not isinstance(k, int) or k <= 0:
             raise ValueError("k must be a positive integer")
 
@@ -128,6 +184,7 @@ class SecureRNG:
 
     def __repr__(self) -> str:
         return (
-            f"SecureRNG(reseed_interval={self._reseed_interval}, "
-            f"counter={self._counter}, generated={self._generated})"
+            f"SecureRNG(counter={self._counter}, "
+            f"generated={self._generated}, "
+            f"pid={self._pid})"
         )
